@@ -11,6 +11,8 @@ interface Image {
 const REGEX_FILE =
   /\!\[(.*?)\]\(<(\S+\.\w+)>\)|\!\[(.*?)\]\((\S+\.\w+)(?:\s+"[^"]*")?\)|\!\[(.*?)\]\((https?:\/\/.*?)\)/g;
 const REGEX_WIKI_FILE = /\!\[\[(.*?)(\s*?\|.*?)?\]\]/g;
+// <img src="url"/> HTML image tag support
+const REGEX_HTML_IMG = /<img[^>]+src\s*=\s*["']([^"']+)["'][^>]*\/?>/gi;
 
 export default class Helper {
   app: App;
@@ -68,9 +70,11 @@ export default class Helper {
   getImageLink(value: string): Image[] {
     const matches = value.matchAll(REGEX_FILE);
     const WikiMatches = value.matchAll(REGEX_WIKI_FILE);
+    const HtmlMatches = value.matchAll(REGEX_HTML_IMG);
 
     let fileArray: Image[] = [];
 
+    // 处理 Markdown 格式：![](url)
     for (const match of matches) {
       const source = match[0];
 
@@ -82,6 +86,13 @@ export default class Helper {
       if (path === undefined) {
         path = match[4];
       }
+      // 处理第三个匹配组：https URL
+      if (name === undefined) {
+        name = match[5];
+      }
+      if (path === undefined) {
+        path = match[6];
+      }
 
       fileArray.push({
         path: path,
@@ -90,6 +101,7 @@ export default class Helper {
       });
     }
 
+    // 处理 Wiki 格式：![[image]]
     for (const match of WikiMatches) {
       let name = parse(match[1]).name;
       const path = match[1];
@@ -97,6 +109,34 @@ export default class Helper {
       if (match[2]) {
         name = `${name}${match[2]}`;
       }
+      fileArray.push({
+        path: path,
+        name: name,
+        source: source,
+      });
+    }
+
+    // 处理 HTML 格式：<img src="url"/>
+    for (const match of HtmlMatches) {
+      const source = match[0];  // 完整的 <img> 标签
+      const path = match[1];    // src 属性中的 URL
+      
+      // 从URL中提取文件名作为name，如果提取失败则使用默认名称
+      let name = "image";
+      try {
+        const url = new URL(path);
+        const pathname = url.pathname;
+        const filename = pathname.substring(pathname.lastIndexOf('/') + 1);
+        if (filename && filename.includes('.')) {
+          name = filename.split('?')[0]; // 去掉查询参数
+        } else if (pathname !== '/') {
+          name = pathname.substring(1); // 去掉开头的 '/'
+        }
+      } catch {
+        // URL解析失败，使用默认名称
+        name = path.includes('/') ? path.split('/').pop().split('?')[0] : "image";
+      }
+
       fileArray.push({
         path: path,
         name: name,

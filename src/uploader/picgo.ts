@@ -70,7 +70,12 @@ export default class PicGoUploader implements Uploader {
         if (typeof item === "string") {
           return item;
         } else {
-          return normalizePath(join(basePath, item.path));
+          // 如果是远程URL，直接返回URL，不要拼接本地路径
+          if (item.path.startsWith("http")) {
+            return item.path;
+          } else {
+            return normalizePath(join(basePath, item.path));
+          }
         }
       });
 

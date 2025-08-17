@@ -9,10 +9,11 @@ import {
   Notice,
   addIcon,
   MarkdownFileInfo,
+  requestUrl,
 } from "obsidian";
-import { resolve, basename, dirname } from "path-browserify";
+import { resolve, basename, dirname, join, parse, relative } from "path-browserify";
 
-import { isAssetTypeAnImage, arrayToObject } from "./utils";
+import { isAssetTypeAnImage, arrayToObject, getUrlAsset, uuid } from "./utils";
 import { downloadAllImageFiles } from "./download";
 import { UploaderManager } from "./uploader/index";
 import { PicGoDeleter } from "./deleter";
@@ -54,8 +55,8 @@ export default class imageAutoUploadPlugin extends Plugin {
     this.addSettingTab(new SettingTab(this.app, this));
 
     this.addCommand({
-      id: "Upload all images",
-      name: "Upload all images",
+      id: "Upload all images_dev",
+      name: "Upload all images_dev",
       checkCallback: (checking: boolean) => {
         let leaf = this.app.workspace.getActiveViewOfType(MarkdownView);
         if (leaf) {
@@ -75,6 +76,36 @@ export default class imageAutoUploadPlugin extends Plugin {
         if (leaf) {
           if (!checking) {
             downloadAllImageFiles(this);
+          }
+          return true;
+        }
+        return false;
+      },
+    });
+
+    this.addCommand({
+      id: "Batch upload folder images",
+      name: "Batch upload folder images",
+      checkCallback: (checking: boolean) => {
+        let leaf = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (leaf) {
+          if (!checking) {
+            this.batchUploadFolderImages();
+          }
+          return true;
+        }
+        return false;
+      },
+    });
+
+    this.addCommand({
+      id: "Batch download folder images",
+      name: "Batch download folder images", 
+      checkCallback: (checking: boolean) => {
+        let leaf = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (leaf) {
+          if (!checking) {
+            this.batchDownloadFolderImages();
           }
           return true;
         }
@@ -303,7 +334,7 @@ export default class imageAutoUploadPlugin extends Plugin {
     for (const match of fileArray) {
       const imageName = match.name;
       const uri = decodeURI(match.path);
-
+      
       if (uri.startsWith("http")) {
         imageList.push({
           path: match.path,
@@ -585,6 +616,327 @@ export default class imageAutoUploadPlugin extends Plugin {
         editor.replaceRange(replacement, from, to);
         break;
       }
+    }
+  }
+
+  /**
+   * 批量上传文件夹中所有Markdown文件的图片
+   */
+  async batchUploadFolderImages() {
+    const activeFile = this.app.workspace.getActiveFile();
+    if (!activeFile) {
+      new Notice("No active file");
+      return;
+    }
+
+    const currentFolder = activeFile.parent;
+    if (!currentFolder) {
+      new Notice("Cannot determine current folder");
+      return;
+    }
+
+    // 获取文件夹中的所有Markdown文件
+    const markdownFiles = currentFolder.children.filter(
+      file => file instanceof TFile && file.extension === 'md'
+    ) as TFile[];
+
+    if (markdownFiles.length === 0) {
+      new Notice("No markdown files found in current folder");
+      return;
+    }
+
+    let totalProcessed = 0;
+    let totalSuccess = 0;
+    let totalImages = 0;
+
+    new Notice(`开始处理 ${markdownFiles.length} 个文件...`);
+
+    for (const file of markdownFiles) {
+      try {
+        // 临时切换到当前处理的文件
+        const leaf = this.app.workspace.getLeaf();
+        await leaf.openFile(file);
+        
+        // 获取该文件的所有图片
+        const fileContent = await this.app.vault.read(file);
+        const imageList = this.filterFile(this.helper.getImageLink(fileContent));
+        
+        if (imageList.length === 0) {
+          totalProcessed++;
+          continue;
+        }
+
+        totalImages += imageList.length;
+        
+        // 处理图片路径和文件对象
+        const processedImages = await this.processImagesForFile(file, imageList);
+        
+        if (processedImages.length > 0) {
+          // 执行上传
+          try {
+            const uploadResult = await this.upload(processedImages);
+            if (uploadResult.success) {
+              // 替换文件中的图片链接
+              await this.replaceImageInFile(file, processedImages, uploadResult.result);
+              totalSuccess += processedImages.length;
+              new Notice(`${file.name}: 上传成功 ${processedImages.length} 张图片`);
+            } else {
+              new Notice(`${file.name}: 上传失败`);
+            }
+          } catch (error) {
+            console.error("Upload error for file:", file.name, error);
+            new Notice(`${file.name}: 上传出错`);
+          }
+        }
+        
+        totalProcessed++;
+      } catch (error) {
+        console.error("Error processing file:", file.name, error);
+        new Notice(`处理文件 ${file.name} 时出错`);
+        totalProcessed++;
+      }
+    }
+
+    // 切换回原始文件
+    const leaf = this.app.workspace.getLeaf();
+    await leaf.openFile(activeFile);
+
+    new Notice(
+      `批量上传完成!\n处理文件: ${totalProcessed}/${markdownFiles.length}\n总图片: ${totalImages}\n成功上传: ${totalSuccess}`
+    );
+  }
+
+  /**
+   * 批量下载文件夹中所有Markdown文件的网络图片
+   */
+  async batchDownloadFolderImages() {
+    const activeFile = this.app.workspace.getActiveFile();
+    if (!activeFile) {
+      new Notice("No active file");
+      return;
+    }
+
+    const currentFolder = activeFile.parent;
+    if (!currentFolder) {
+      new Notice("Cannot determine current folder");
+      return;
+    }
+
+    // 获取文件夹中的所有Markdown文件
+    const markdownFiles = currentFolder.children.filter(
+      file => file instanceof TFile && file.extension === 'md'
+    ) as TFile[];
+
+    if (markdownFiles.length === 0) {
+      new Notice("No markdown files found in current folder");
+      return;
+    }
+
+    let totalProcessed = 0;
+    let totalSuccess = 0;
+    let totalImages = 0;
+
+    new Notice(`开始处理 ${markdownFiles.length} 个文件...`);
+
+    // 创建下载目录
+    const folderPath = await this.app.fileManager.getAvailablePathForAttachment("");
+    if (!(await this.app.vault.adapter.exists(folderPath))) {
+      await this.app.vault.adapter.mkdir(folderPath);
+    }
+
+    for (const file of markdownFiles) {
+      try {
+        // 读取文件内容
+        const fileContent = await this.app.vault.read(file);
+        const imageList = this.helper.getImageLink(fileContent);
+        
+        // 只处理网络图片
+        const networkImages = imageList.filter(img => img.path.startsWith("http"));
+        
+        if (networkImages.length === 0) {
+          totalProcessed++;
+          continue;
+        }
+
+        totalImages += networkImages.length;
+        
+        // 下载图片并替换链接
+        const downloadResults = await this.downloadImagesForFile(file, networkImages, folderPath);
+        
+        if (downloadResults.length > 0) {
+          // 替换文件中的图片链接
+          let newContent = fileContent;
+          downloadResults.forEach(result => {
+            const name = this.handleName(result.name);
+            newContent = newContent.replace(result.source, `![${name}](${encodeURI(result.path)})`);
+          });
+          
+          await this.app.vault.modify(file, newContent);
+          totalSuccess += downloadResults.length;
+          new Notice(`${file.name}: 下载成功 ${downloadResults.length} 张图片`);
+        }
+        
+        totalProcessed++;
+      } catch (error) {
+        console.error("Error processing file:", file.name, error);
+        new Notice(`处理文件 ${file.name} 时出错`);
+        totalProcessed++;
+      }
+    }
+
+    new Notice(
+      `批量下载完成!\n处理文件: ${totalProcessed}/${markdownFiles.length}\n总图片: ${totalImages}\n成功下载: ${totalSuccess}`
+    );
+  }
+
+  /**
+   * 为特定文件处理图片对象
+   */
+  private async processImagesForFile(file: TFile, imageList: Image[]) {
+    const fileMap = arrayToObject(this.app.vault.getFiles(), "name");
+    const filePathMap = arrayToObject(this.app.vault.getFiles(), "path");
+    const processedImages: (Image & { file: TFile | null })[] = [];
+
+    for (const match of imageList) {
+      const uri = decodeURI(match.path);
+      
+      if (uri.startsWith("http")) {
+        processedImages.push({
+          path: match.path,
+          name: match.name,
+          source: match.source,
+          file: null,
+        });
+      } else {
+        // 处理本地文件路径（相对于当前处理的文件）
+        const fileName = basename(uri);
+        let targetFile: TFile | undefined | null;
+        
+        // 优先匹配绝对路径
+        if (filePathMap[uri]) {
+          targetFile = filePathMap[uri];
+        }
+        
+        // 相对路径处理
+        if ((!targetFile && uri.startsWith("./")) || uri.startsWith("../")) {
+          const filePath = normalizePath(
+            resolve(dirname(file.path), uri)
+          );
+          targetFile = filePathMap[filePath];
+        }
+        
+        // 尽可能短路径
+        if (!targetFile) {
+          targetFile = fileMap[fileName];
+        }
+        
+        if (targetFile && isAssetTypeAnImage(targetFile.path)) {
+          processedImages.push({
+            path: normalizePath(targetFile.path),
+            name: match.name,
+            source: match.source,
+            file: targetFile,
+          });
+        }
+      }
+    }
+
+    return processedImages;
+  }
+
+  /**
+   * 替换文件中的图片链接
+   */
+  private async replaceImageInFile(file: TFile, imageList: Image[], uploadUrlList: string[]) {
+    let content = await this.app.vault.read(file);
+    
+    imageList.forEach((item, index) => {
+      const uploadUrl = uploadUrlList[index];
+      if (uploadUrl) {
+        const name = this.handleName(item.name);
+        content = content.replaceAll(item.source, `![${name}](${uploadUrl})`);
+      }
+    });
+    
+    await this.app.vault.modify(file, content);
+    
+    // 如果需要删除源文件
+    if (this.settings.deleteSource) {
+      imageList.forEach(image => {
+        if (image.file && !image.path.startsWith("http")) {
+          this.app.fileManager.trashFile(image.file);
+        }
+      });
+    }
+  }
+
+  /**
+   * 为特定文件下载图片
+   */
+  private async downloadImagesForFile(file: TFile, networkImages: Image[], folderPath: string) {
+    const downloadResults = [];
+    
+    for (const image of networkImages) {
+      try {
+        const url = image.path;
+        const asset = getUrlAsset(url);
+        let name = decodeURI(parse(asset).name).replaceAll(/[\\\\/:*?\"<>|]/g, "-");
+        
+        const response = await this.downloadImage(url, folderPath, name);
+        if (response.ok) {
+          const relativePath = normalizePath(
+            relative(normalizePath(file.parent.path), normalizePath(response.path))
+          );
+          
+          downloadResults.push({
+            source: image.source,
+            name: name,
+            path: relativePath,
+          });
+        }
+      } catch (error) {
+        console.error("Download error for image:", image.path, error);
+      }
+    }
+    
+    return downloadResults;
+  }
+
+  /**
+   * 下载单个图片
+   */
+  private async downloadImage(url: string, folderPath: string, name: string) {
+    try {
+      const response = await requestUrl({ url });
+      
+      if (response.status !== 200) {
+        return { ok: false, msg: "HTTP error" };
+      }
+      
+      // 简单的图片类型检测，基于URL扩展名
+      const urlExt = url.split('.').pop()?.toLowerCase();
+      const validExts = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg'];
+      const ext = validExts.includes(urlExt) ? urlExt : 'jpg';
+      
+      let path = normalizePath(join(folderPath, `${name}.${ext}`));
+      
+      // 如果文件名已存在，则用随机值替换
+      if (await this.app.vault.adapter.exists(path)) {
+        path = normalizePath(join(folderPath, `${uuid()}.${ext}`));
+      }
+      
+      await this.app.vault.adapter.writeBinary(path, response.arrayBuffer);
+      return {
+        ok: true,
+        msg: "ok",
+        path: path,
+        type: { ext },
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        msg: err,
+      };
     }
   }
 }
